@@ -1,0 +1,38 @@
+# Runtime/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Large generated data/artifacts
+data/
+models/
+reports/
+tmp_shadow_stage/
+pm-shadow-deploy.tar.gz
+
+# Local/machine-specific
+Microsoft/
+*.pem
+*.key
+*.secret
+
+# Logs
+*.log
+logs/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

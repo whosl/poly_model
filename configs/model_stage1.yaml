@@ -1,0 +1,35 @@
+﻿data:
+  btc_direction: data/gold/btc_direction_1s
+  pm_terminal: data/gold/pm_terminal_1s
+  pm_repricing: data/gold/pm_repricing_1s
+
+reports:
+  eda_dir: reports/eda
+  stage1_dir: reports/stage1
+
+models:
+  lightgbm:
+    num_leaves: 63
+    learning_rate: 0.03
+    n_estimators: 1000
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_samples: 100
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+
+  logistic_regression:
+    max_iter: 1000
+    class_weight: balanced
+
+evaluation:
+  edge_thresholds: [0.01, 0.02, 0.03, 0.05, 0.08, 0.10]
+  time_to_expiry_buckets:
+    - [240, 300]
+    - [180, 240]
+    - [120, 180]
+    - [60, 120]
+    - [30, 60]
+    - [10, 30]
+    - [0, 10]

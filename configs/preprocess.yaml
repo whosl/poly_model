@@ -1,0 +1,80 @@
+raw_paths:
+  base: data/raw
+  binance: data/raw/binance
+  polymarket: data/raw/polymarket
+
+output_paths:
+  bronze: data/bronze
+  silver: data/silver
+  gold: data/gold
+  reports: reports
+
+symbols:
+  - BTCUSDT
+
+sample_grid:
+  binance_freq: "1s"
+  pm_freq: "1s"
+  repricing_freq: "1s"
+
+horizons:
+  btc_direction: ["1s", "5s", "30s"]
+  pm_markout: ["1s", "5s", "30s"]
+
+polymarket:
+  quote_ttl_seconds: 5
+  market_duration_seconds: 300
+
+features:
+  depth_levels: 5
+  agg_windows: ["1s", "5s", "30s"]
+  vol_windows: ["10s", "30s", "60s"]
+
+split:
+  method: "time"
+  train_ratio: 0.70
+  valid_ratio: 0.15
+  test_ratio: 0.15
+
+labeling:
+  btc_direction:
+    threshold_mode: fixed_bps
+    fixed_bps: 1.0
+    volatility_multiplier: 0.1
+
+inspect:
+  sample_lines: 20
+
+io:
+  parquet_compression: zstd
+  parquet_row_group_size: 50000
+  bronze_batch_size: 50000
+
+schema_mapping:
+  binance:
+    stream_field_candidates: ["raw.stream", "stream"]
+    payload_field_candidates: ["raw.data", "data", "raw"]
+    recv_ts_candidates: ["recv_ns", "ts_recv", "received_at"]
+    event_ts_candidates: ["E", "T", "timestamp", "event_time", "transactTime"]
+    symbol_candidates: ["s", "symbol"]
+    bookticker:
+      bid_price_candidates: ["b", "bidPrice", "bid_price"]
+      bid_qty_candidates: ["B", "bidQty", "bid_qty"]
+      ask_price_candidates: ["a", "askPrice", "ask_price"]
+      ask_qty_candidates: ["A", "askQty", "ask_qty"]
+    aggtrade:
+      price_candidates: ["p", "price"]
+      qty_candidates: ["q", "qty", "quantity"]
+      buyer_maker_candidates: ["m", "isBuyerMaker", "is_buyer_maker"]
+    depth:
+      bids_candidates: ["bids", "b"]
+      asks_candidates: ["asks", "a"]
+  polymarket:
+    recv_ts_candidates: ["recv_ns", "ts_recv", "received_at"]
+    market_id_candidates: ["market", "market_id"]
+    asset_id_candidates: ["asset_id", "token_id"]
+    event_ts_candidates: ["timestamp", "ts_event", "event_time"]
+    outcome_candidates: ["outcome", "side_name", "token_outcome"]
+    orderbook_bids_candidates: ["bids"]
+    orderbook_asks_candidates: ["asks"]
+    price_change_array_candidates: ["price_changes", "changes"]

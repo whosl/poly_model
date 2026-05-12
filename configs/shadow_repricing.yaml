@@ -1,0 +1,51 @@
+enable_trading: false
+
+model:
+  model_path: models/pm_repricing/lightgbm_5s.joblib
+  features_path: models/pm_repricing/features_pm_repricing.json
+  version: pm_repricing_lightgbm_5s_v1
+
+market_meta:
+  silver_pm_path: data/silver/pm_1s
+
+output:
+  base_dir: data/shadow
+
+binance:
+  symbol: BTCUSDT
+  ws_url: wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade
+
+polymarket:
+  # Fill in the live PM websocket URL before non-dry-run usage.
+  ws_url: ""
+  subscribe_messages: []
+
+signal_configs:
+  - name: baseline_repricing_070
+    direction: BOTH
+    threshold_up: 0.70
+    threshold_down: 0.70
+    max_spread: 0.10
+    min_tte: 10
+    cooldown_seconds: 10
+
+  - name: high_conf_tight_spread
+    direction: UP
+    threshold_up: 0.80
+    threshold_down: null
+    max_spread: 0.02
+    min_tte: 60
+    cooldown_seconds: 10
+
+  - name: high_conf_medium_spread
+    direction: UP
+    threshold_up: 0.80
+    threshold_down: null
+    max_spread: 0.05
+    min_tte: 30
+    cooldown_seconds: 10
+
+dry_run:
+  historical_gold_path: data/gold/pm_repricing_1s
+  max_rows: 5000
+  reset_cooldown_per_row: false

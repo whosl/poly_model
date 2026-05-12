@@ -1,0 +1,9 @@
+joblib
+lightgbm
+numpy
+orjson
+polars
+PyYAML
+pytest
+scikit-learn>=1.7,<1.8
+websockets

@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket Repricing Shadow Logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pm-shadow/repo
+ExecStartPre=/opt/pm-shadow/venv/bin/python scripts/refresh_live_pm_market_meta.py --output-path configs/shadow_market_meta.parquet --report-path /opt/pm-shadow/reports/shadow/live_market_meta_refresh.md --lookback-minutes 30 --lookahead-hours 24
+ExecStart=/opt/pm-shadow/venv/bin/python scripts/run_pm_repricing_shadow.py --config configs/shadow_repricing.lightsail.yaml --duration-minutes 60
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/opt/pm-shadow/logs/shadow_stdout.log
+StandardError=append:/opt/pm-shadow/logs/shadow_stderr.log
+
+[Install]
+WantedBy=multi-user.target

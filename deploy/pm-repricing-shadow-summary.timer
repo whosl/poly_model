@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily PM repricing shadow summary timer
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+Unit=pm-repricing-shadow-summary.service
+
+[Install]
+WantedBy=timers.target

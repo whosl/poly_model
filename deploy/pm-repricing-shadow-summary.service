@@ -1,0 +1,12 @@
+[Unit]
+Description=Generate daily PM repricing shadow summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-shadow/repo
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -lc '/opt/pm-shadow/venv/bin/python scripts/summarize_repricing_shadow.py --config configs/shadow_repricing.lightsail.yaml --date $(date -u +%%F)'
+StandardOutput=append:/opt/pm-shadow/logs/shadow_summary_stdout.log
+StandardError=append:/opt/pm-shadow/logs/shadow_summary_stderr.log
