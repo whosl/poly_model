@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -33,6 +34,13 @@ import orjson
 import polars as pl
 import websockets
 import yaml
+
+try:
+    from refresh_live_pm_market_meta import gamma_get_market_by_slug, market_to_row, slugs_for_btc_15m
+except Exception:  # pragma: no cover - live refresh is best-effort.
+    gamma_get_market_by_slug = None
+    market_to_row = None
+    slugs_for_btc_15m = None
 
 
 LOGGER = logging.getLogger("pm_shadow")
@@ -548,6 +556,66 @@ class ShadowRuntime:
             asset_map[meta.yes_asset_id] = (meta.market_id, "UP")
             asset_map[meta.no_asset_id] = (meta.market_id, "DOWN")
         return metas, asset_map
+
+    def refresh_live_market_meta(self, cfg: dict[str, Any]) -> int:
+        """Refresh BTC 15m market metadata in-process and merge it into runtime state.
+
+        The BTC 15m market slug is deterministic, so the process does not need to be
+        restarted just to discover new markets. This best-effort refresh queries Gamma
+        for the rolling slug window, rewrites the configured metadata parquet, and
+        updates the in-memory market/asset maps used by the Polymarket websocket parser.
+        """
+        if gamma_get_market_by_slug is None or market_to_row is None or slugs_for_btc_15m is None:
+            LOGGER.warning("Live market metadata refresh unavailable; refresh_live_pm_market_meta import failed")
+            return 0
+        pm_feed_cfg = _get_nested(cfg, "feeds", "polymarket", default={}) or {}
+        lookback_minutes = float(pm_feed_cfg.get("metadata_refresh_lookback_minutes", 30))
+        lookahead_hours = float(pm_feed_cfg.get("metadata_refresh_lookahead_hours", 4))
+        timeout_seconds = float(pm_feed_cfg.get("metadata_refresh_timeout_seconds", 10))
+        sleep_seconds = float(pm_feed_cfg.get("metadata_refresh_sleep_seconds", 0.02))
+        started = utc_now()
+        rows: list[dict[str, Any]] = []
+        misses = 0
+        for slug, start_ts, end_ts in slugs_for_btc_15m(started, int(lookback_minutes), lookahead_hours):
+            try:
+                market = gamma_get_market_by_slug(slug, timeout_seconds)
+                row = market_to_row(market, start_ts, end_ts) if market else None
+            except Exception:
+                row = None
+            if row is None:
+                misses += 1
+            elif row["market_end_ts"] >= started - timedelta(minutes=lookback_minutes):
+                rows.append(row)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+        if not rows:
+            LOGGER.warning("Live market metadata refresh found no rows (misses=%s)", misses)
+            return 0
+
+        df = pl.DataFrame(rows).unique(subset=["market_id"], keep="first").sort("market_start_ts")
+        out = Path(cfg["market_meta"]["silver_pm_path"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out)
+
+        new_metas, new_asset_map = self._load_market_meta(str(out))
+        added = 0
+        for market_id, meta in new_metas.items():
+            if market_id not in self.market_meta:
+                added += 1
+                self.market_states[market_id] = MarketState(meta=meta)
+            elif market_id in self.market_states:
+                self.market_states[market_id].meta = meta
+            self.market_meta[market_id] = meta
+        self.asset_to_market.update(new_asset_map)
+        LOGGER.info(
+            "Live market metadata refreshed: rows=%s added=%s total=%s misses=%s max_end=%s",
+            len(new_metas),
+            added,
+            len(self.market_meta),
+            misses,
+            df["market_end_ts"].max(),
+        )
+        return added
 
     def _load_replay_windows(self, path: str | None) -> None:
         if not path:
@@ -1351,6 +1419,16 @@ def build_pm_subscribe_messages(rt: ShadowRuntime, cfg: dict[str, Any]) -> list[
     return messages
 
 
+def pm_active_asset_ids(rt: ShadowRuntime, cfg: dict[str, Any]) -> set[str]:
+    asset_ids: set[str] = set()
+    for meta in _active_pm_subscription_metas(rt, cfg):
+        if meta.yes_asset_id:
+            asset_ids.add(str(meta.yes_asset_id))
+        if meta.no_asset_id:
+            asset_ids.add(str(meta.no_asset_id))
+    return asset_ids
+
+
 async def _polymarket_app_heartbeat(ws: Any, interval_seconds: float = 10.0) -> None:
     """Polymarket market/user channels require an application-level PING text.
 
@@ -1374,16 +1452,46 @@ async def polymarket_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
     async with websockets.connect(url, ping_interval=None, ping_timeout=None, max_size=2**23) as ws:
         heartbeat_task = asyncio.create_task(_polymarket_app_heartbeat(ws))
         try:
+            pm_feed_cfg = _get_nested(cfg, "feeds", "polymarket", default={}) or {}
+            online_refresh = bool(pm_feed_cfg.get("online_metadata_refresh_enabled", True))
+            refresh_interval_s = float(pm_feed_cfg.get("online_metadata_refresh_seconds", 300))
+            next_refresh = utc_now() + timedelta(seconds=max(30.0, refresh_interval_s))
+            subscribed_assets: set[str] = set()
+
             subs = build_pm_subscribe_messages(rt, cfg)
             if not subs:
                 raise RuntimeError("No Polymarket subscribe messages available; refresh market metadata or provide explicit subscribe_messages")
             for sub in subs:
                 await ws.send(orjson.dumps(sub).decode("utf-8"))
                 LOGGER.info("Sent Polymarket subscription with %s asset(s)", len(sub.get("assets_ids", [])))
+                subscribed_assets.update(str(x) for x in sub.get("assets_ids", []))
                 await asyncio.sleep(0.1)
             first_logged = False
             async for msg in ws:
                 recv_ts = utc_now()
+                if online_refresh and recv_ts >= next_refresh:
+                    try:
+                        await asyncio.to_thread(rt.refresh_live_market_meta, cfg)
+                        wanted_assets = pm_active_asset_ids(rt, cfg)
+                        new_assets = sorted(wanted_assets - subscribed_assets)
+                        if new_assets:
+                            channel = (
+                                _get_nested(cfg, "feeds", "polymarket", "market_channel", default=None)
+                                or cfg["polymarket"].get("market_channel")
+                                or "market"
+                            )
+                            batch_size = int(pm_feed_cfg.get("subscribe_batch_size", 20))
+                            batch_size = max(1, min(batch_size, 200))
+                            for idx in range(0, len(new_assets), batch_size):
+                                sub = {"type": channel, "assets_ids": new_assets[idx : idx + batch_size], "custom_feature_enabled": True}
+                                await ws.send(orjson.dumps(sub).decode("utf-8"))
+                                LOGGER.info("Sent Polymarket incremental subscription with %s new asset(s)", len(sub["assets_ids"]))
+                                await asyncio.sleep(0.1)
+                            subscribed_assets.update(new_assets)
+                    except Exception as exc:
+                        LOGGER.warning("Online Polymarket metadata refresh failed: %s", exc)
+                    finally:
+                        next_refresh = utc_now() + timedelta(seconds=max(30.0, refresh_interval_s))
                 if isinstance(msg, str) and msg.strip().upper() == "PONG":
                     continue
                 try:

@@ -40,6 +40,10 @@ feeds:
     subscribe_batch_size: 20
     subscribe_lookback_seconds: 300
     subscribe_lookahead_seconds: 1800
+    online_metadata_refresh_enabled: true
+    online_metadata_refresh_seconds: 300
+    metadata_refresh_lookback_minutes: 30
+    metadata_refresh_lookahead_hours: 4
 
 binance:
   symbol: BTCUSDT
