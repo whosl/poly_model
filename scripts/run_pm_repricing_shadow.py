@@ -491,6 +491,7 @@ class ShadowRuntime:
         self.signal_cfg_by_name = {x.name: x for x in self.signal_configs}
         self.market_meta, self.asset_to_market = self._load_market_meta(cfg["market_meta"]["silver_pm_path"])
         self.market_states: dict[str, MarketState] = {mid: MarketState(meta=m) for mid, m in self.market_meta.items()}
+        self.last_pm_quote_recv_ts: datetime | None = None
         self.binance = BinanceState()
         self.last_signal_ts: dict[tuple[str, str, str], datetime] = {}
         self.pending: list[PendingOutcome] = []
@@ -804,6 +805,7 @@ class ShadowRuntime:
         )
 
     def update_pm_quote(self, event: dict[str, Any], recv_ts: datetime) -> None:
+        self.last_pm_quote_recv_ts = recv_ts
         asset_id = str(event.get("asset_id") or event.get("token_id") or "")
         market_id = str(event.get("market_id") or event.get("market") or "")
         if not market_id and asset_id in self.asset_to_market:
@@ -1429,6 +1431,21 @@ def pm_active_asset_ids(rt: ShadowRuntime, cfg: dict[str, Any]) -> set[str]:
     return asset_ids
 
 
+def build_pm_incremental_subscribe_messages(asset_ids: list[str], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build Polymarket's in-connection subscribe operation for newly discovered assets."""
+    pm_feed_cfg = _get_nested(cfg, "feeds", "polymarket", default={}) or {}
+    batch_size = int(pm_feed_cfg.get("subscribe_batch_size", 20))
+    batch_size = max(1, min(batch_size, 200))
+    messages: list[dict[str, Any]] = []
+    for idx in range(0, len(asset_ids), batch_size):
+        # Per Polymarket CLOB WSS docs, updating an existing market-channel
+        # subscription uses operation=subscribe with assets_ids. The initial
+        # channel message uses type=market; using type=market again mid-stream
+        # can leave the socket connected but not subscribed to new assets.
+        messages.append({"operation": "subscribe", "assets_ids": asset_ids[idx : idx + batch_size]})
+    return messages
+
+
 async def _polymarket_app_heartbeat(ws: Any, interval_seconds: float = 10.0) -> None:
     """Polymarket market/user channels require an application-level PING text.
 
@@ -1455,6 +1472,7 @@ async def polymarket_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
             pm_feed_cfg = _get_nested(cfg, "feeds", "polymarket", default={}) or {}
             online_refresh = bool(pm_feed_cfg.get("online_metadata_refresh_enabled", True))
             refresh_interval_s = float(pm_feed_cfg.get("online_metadata_refresh_seconds", 300))
+            stale_reconnect_s = float(pm_feed_cfg.get("quote_stale_reconnect_seconds", 120))
             next_refresh = utc_now() + timedelta(seconds=max(30.0, refresh_interval_s))
             subscribed_assets: set[str] = set()
 
@@ -1475,20 +1493,16 @@ async def polymarket_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
                         wanted_assets = pm_active_asset_ids(rt, cfg)
                         new_assets = sorted(wanted_assets - subscribed_assets)
                         if new_assets:
-                            channel = (
-                                _get_nested(cfg, "feeds", "polymarket", "market_channel", default=None)
-                                or cfg["polymarket"].get("market_channel")
-                                or "market"
-                            )
-                            batch_size = int(pm_feed_cfg.get("subscribe_batch_size", 20))
-                            batch_size = max(1, min(batch_size, 200))
-                            for idx in range(0, len(new_assets), batch_size):
-                                sub = {"type": channel, "assets_ids": new_assets[idx : idx + batch_size], "custom_feature_enabled": True}
+                            for sub in build_pm_incremental_subscribe_messages(new_assets, cfg):
                                 await ws.send(orjson.dumps(sub).decode("utf-8"))
                                 LOGGER.info("Sent Polymarket incremental subscription with %s new asset(s)", len(sub["assets_ids"]))
                                 await asyncio.sleep(0.1)
                             subscribed_assets.update(new_assets)
+                        if rt.last_pm_quote_recv_ts is not None and (utc_now() - rt.last_pm_quote_recv_ts).total_seconds() > stale_reconnect_s:
+                            raise RuntimeError(f"Polymarket quote stale for >{stale_reconnect_s:.0f}s; reconnecting to resubscribe active assets")
                     except Exception as exc:
+                        if "quote stale" in str(exc).lower():
+                            raise
                         LOGGER.warning("Online Polymarket metadata refresh failed: %s", exc)
                     finally:
                         next_refresh = utc_now() + timedelta(seconds=max(30.0, refresh_interval_s))
@@ -1497,7 +1511,8 @@ async def polymarket_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
                 try:
                     raw = orjson.loads(msg)
                 except Exception as exc:
-                    LOGGER.warning("Failed to decode Polymarket websocket message: %s", exc)
+                    preview = msg[:120] if isinstance(msg, str) else str(msg)[:120]
+                    LOGGER.warning("Failed to decode Polymarket websocket message: %s preview=%r", exc, preview)
                     continue
                 if not first_logged:
                     preview = msg[:500] if isinstance(msg, str) else str(msg)[:500]

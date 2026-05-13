@@ -44,6 +44,7 @@ feeds:
     online_metadata_refresh_seconds: 300
     metadata_refresh_lookback_minutes: 30
     metadata_refresh_lookahead_hours: 4
+    quote_stale_reconnect_seconds: 120
 
 binance:
   symbol: BTCUSDT
