@@ -377,6 +377,7 @@ class MarketState:
     pm_mid_hist: deque[tuple[datetime, float]] = field(default_factory=deque)
     last_pm_update_ts: datetime | None = None
     last_sample_ts: datetime | None = None
+    btc_open_price: float | None = None
 
 
 @dataclass
@@ -920,6 +921,8 @@ class ShadowRuntime:
         st = self.market_states[market_id]
         if self.binance.mid is None or st.yes.mid is None or st.no.mid is None:
             return None
+        if st.btc_open_price is None:
+            st.btc_open_price = self.binance.mid
         if st.meta.market_end_ts is None or st.meta.market_start_ts is None:
             return None
         tte = (st.meta.market_end_ts - recv_ts).total_seconds()
@@ -946,7 +949,8 @@ class ShadowRuntime:
         if self.binance.bid is not None and self.binance.ask is not None and self.binance.bid_qty is not None and self.binance.ask_qty is not None and self.binance.bid_qty + self.binance.ask_qty > 0:
             micro = (self.binance.ask * self.binance.bid_qty + self.binance.bid * self.binance.ask_qty) / (self.binance.bid_qty + self.binance.ask_qty)
             btc_micro = micro - self.binance.mid
-        formula_p_yes = 0.5
+        vol60 = self._rolling_std_logret(self.binance.mid_hist, 60)
+        formula_p_yes = self._formula_p_yes(self.binance.mid, st.btc_open_price, vol60, tte) or 0.5
         feature_map = {
             "time_to_expiry_seconds": tte,
             "time_elapsed_seconds": elapsed,
@@ -975,7 +979,7 @@ class ShadowRuntime:
             "btc_return_30s": None if lag30 in (None, 0) else (self.binance.mid / lag30 - 1.0),
             "realized_vol_10s": self._rolling_std_logret(self.binance.mid_hist, 10),
             "realized_vol_30s": self._rolling_std_logret(self.binance.mid_hist, 30),
-            "btc_realized_vol_60s": self._rolling_std_logret(self.binance.mid_hist, 60),
+            "btc_realized_vol_60s": vol60,
             "formula_p_yes": formula_p_yes,
             "formula_p_yes_minus_yes_mid": formula_p_yes - st.yes.mid,
             "formula_p_yes_minus_yes_ask": None if st.yes.ask is None else formula_p_yes - st.yes.ask,
@@ -999,6 +1003,20 @@ class ShadowRuntime:
         }
         self._add_v3_derived_features(feature_map)
         return feature_map
+
+    @staticmethod
+    def _normal_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def _formula_p_yes(self, current_price: float | None, open_price: float | None, sigma: float | None, tau: float | None) -> float | None:
+        if current_price is None or open_price is None or sigma is None or tau is None:
+            return None
+        if current_price <= 0 or open_price <= 0:
+            return None
+        sigma = max(float(sigma), 1e-6)
+        tau = max(float(tau), 1.0)
+        z = math.log(current_price / open_price) / (sigma * math.sqrt(tau))
+        return min(0.999, max(0.001, self._normal_cdf(z)))
 
     @staticmethod
     def _num(v: Any) -> float | None:
