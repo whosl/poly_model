@@ -43,7 +43,7 @@ feeds:
 
 binance:
   symbol: BTCUSDT
-  ws_url: wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade
+  ws_url: wss://stream.binance.com:443/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade
 
 polymarket:
   ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"

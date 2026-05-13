@@ -1231,7 +1231,19 @@ class ShadowRuntime:
 
 async def binance_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
     url = cfg["binance"]["ws_url"]
-    async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
+    # Binance already sends enough traffic on bookTicker/aggTrade for BTCUSDT; client-side
+    # websocket pings have been a common source of false-positive keepalive timeouts on
+    # Lightsail. Disable protocol pings and rely on the outer resilient task to reconnect
+    # if messages stop or the TCP connection closes. Prefer port 443 in config; it is less
+    # likely to be filtered/throttled than 9443 on some networks.
+    async with websockets.connect(
+        url,
+        ping_interval=None,
+        ping_timeout=None,
+        open_timeout=15,
+        close_timeout=5,
+        max_size=2**22,
+    ) as ws:
         async for msg in ws:
             recv_ts = utc_now()
             try:
