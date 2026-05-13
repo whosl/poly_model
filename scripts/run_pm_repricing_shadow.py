@@ -227,9 +227,9 @@ def validate_shadow_config(cfg: dict[str, Any]) -> None:
     model = cfg.get("model") or {}
     if not model.get("features_path"):
         raise RuntimeError("shadow config missing features_path")
-    if model.get("type") == "executable_net_binary":
+    if model.get("type") in {"executable_net_binary", "edge_v3"}:
         if not model.get("up_model_path") or not model.get("down_model_path"):
-            raise RuntimeError("executable_net_binary requires up_model_path/down_model_path")
+            raise RuntimeError(f"{model.get('type')} requires up_model_path/down_model_path")
     elif not model.get("model_path"):
         raise RuntimeError("shadow config missing model_path")
 
@@ -479,7 +479,7 @@ class ShadowRuntime:
         self.replay_mode = bool(args.replay_windows)
         self.feature_names = read_json(cfg["model"]["features_path"])
         self.model_type = cfg["model"].get("type", "multiclass_repricing")
-        if self.model_type == "executable_net_binary":
+        if self.model_type in {"executable_net_binary", "edge_v3"}:
             self.model = None
             self.model_up = joblib.load(cfg["model"]["up_model_path"])
             self.model_down = joblib.load(cfg["model"]["down_model_path"])
@@ -965,13 +965,89 @@ class ShadowRuntime:
             "btc_depth_imbalance_5": btc_di,
             "latency_seconds": 0,
         }
+        self._add_v3_derived_features(feature_map)
         return feature_map
+
+    @staticmethod
+    def _num(v: Any) -> float | None:
+        try:
+            if v is None:
+                return None
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return None
+            return x
+        except Exception:
+            return None
+
+    def _add_v3_derived_features(self, f: dict[str, Any]) -> None:
+        """Add v3 live-safe derived features in-place."""
+        def n(k: str) -> float | None:
+            return self._num(f.get(k))
+        def div(a: float | None, b: float | None) -> float | None:
+            if a is None or b is None or abs(b) <= 1e-12:
+                return None
+            return a / b
+        def sub(a: float | None, b: float | None) -> float | None:
+            return None if a is None or b is None else a - b
+        def add(a: float | None, b: float | None) -> float | None:
+            return None if a is None or b is None else a + b
+        def mul(a: float | None, b: float | None) -> float | None:
+            return None if a is None or b is None else a * b
+
+        tte = n("time_to_expiry_seconds")
+        elapsed = n("time_elapsed_seconds")
+        log_tte = math.log1p(max(0.0, tte)) if tte is not None else None
+        f["log_tte"] = log_tte
+        f["time_frac_elapsed"] = div(elapsed, add(elapsed, tte))
+        for s in (300, 180, 120, 60):
+            f[f"tte_le_{s}"] = None if tte is None else int(tte <= s)
+        formula = n("formula_p_yes")
+        yes_ask = n("yes_ask")
+        no_ask = n("no_ask")
+        yes_mid = n("yes_mid")
+        no_mid = n("no_mid")
+        f["yes_ask_minus_formula_p_yes"] = sub(yes_ask, formula)
+        f["no_ask_minus_formula_p_no"] = None if no_ask is None or formula is None else no_ask - (1.0 - formula)
+        f["abs_formula_gap_yes_mid"] = None if formula is None or yes_mid is None else abs(formula - yes_mid)
+        f["pair_ask_overround"] = None if n("pair_ask_sum") is None else n("pair_ask_sum") - 1.0
+        f["pair_bid_underround"] = None if n("pair_bid_sum") is None else 1.0 - n("pair_bid_sum")
+        f["pair_mid_sum_excess"] = None if n("pair_mid_sum_live") is None else n("pair_mid_sum_live") - 1.0
+        f["yes_depth_skew_abs"] = sub(n("yes_ask_depth_5"), n("yes_bid_depth_5"))
+        f["no_depth_skew_abs"] = sub(n("no_ask_depth_5"), n("no_bid_depth_5"))
+        yr = div(n("yes_ask_depth_5"), (n("yes_bid_depth_5") or 0.0) + 1e-9 if n("yes_bid_depth_5") is not None else None)
+        nr = div(n("no_ask_depth_5"), (n("no_bid_depth_5") or 0.0) + 1e-9 if n("no_bid_depth_5") is not None else None)
+        f["log_yes_ask_bid_depth_ratio"] = None if yr is None else math.log1p(max(0.0, yr))
+        f["log_no_ask_bid_depth_ratio"] = None if nr is None else math.log1p(max(0.0, nr))
+        f["sum_side_spreads"] = add(n("yes_spread"), n("no_spread"))
+        f["spread_diff_yes_no"] = sub(n("yes_spread"), n("no_spread"))
+        f["yes_no_mid_diff"] = sub(yes_mid, no_mid)
+        f["pm_mid_change_1s_rel"] = sub(n("pm_yes_mid_change_1s_past"), n("pm_no_mid_change_1s_past"))
+        f["pm_mid_change_5s_rel"] = sub(n("pm_yes_mid_change_5s_past"), n("pm_no_mid_change_5s_past"))
+        for sec in (1, 5, 10, 30):
+            f[f"btc_ret{sec}_x_logtte"] = mul(n(f"btc_return_{sec}s"), log_tte)
+        vol = (n("btc_realized_vol_60s") or 0.0) + 1e-9
+        f["btc_ret5_vol_adj"] = div(n("btc_return_5s"), vol)
+        f["btc_ret10_vol_adj"] = div(n("btc_return_10s"), vol)
+        f["btc_ret30_vol_adj"] = div(n("btc_return_30s"), vol)
+        f["btc_ret_1m5_reversal"] = sub(n("btc_return_1s"), n("btc_return_5s"))
+        f["btc_ret_5m30_reversal"] = sub(n("btc_return_5s"), n("btc_return_30s"))
+        f["btc_trade_imb_1m5"] = sub(n("btc_trade_imbalance_1s"), n("btc_trade_imbalance_5s"))
+        f["btc_trade_imb_5m30"] = sub(n("btc_trade_imbalance_5s"), n("btc_trade_imbalance_30s"))
+        f["btc_depth_x_trade_imb5"] = mul(n("btc_depth_imbalance_5"), n("btc_trade_imbalance_5s"))
+        f["formula_yes_edge_x_btc_ret5_vol"] = mul(n("formula_p_yes_minus_yes_ask"), n("btc_ret5_vol_adj"))
+        f["formula_no_edge_x_btc_ret5_vol"] = mul(n("formula_p_no_minus_no_ask"), None if n("btc_ret5_vol_adj") is None else -n("btc_ret5_vol_adj"))
+        f["sum_quote_age"] = (n("yes_quote_age_seconds") if n("yes_quote_age_seconds") is not None else 999.0) + (n("no_quote_age_seconds") if n("no_quote_age_seconds") is not None else 999.0)
+        a, b = n("yes_quote_age_seconds"), n("no_quote_age_seconds")
+        f["max_quote_age"] = None if a is None and b is None else max(-1e9 if a is None else a, -1e9 if b is None else b)
 
     def _feature_map_from_historical_gold(self, market_id: str, recv_ts: datetime) -> dict[str, float | None] | None:
         row = self.historical_gold_lookup.get((market_id, recv_ts))
         if row is None:
             return None
-        return {name: row.get(name) for name in self.feature_names}
+        feature_map = {name: row.get(name) for name in self.feature_names}
+        self._add_v3_derived_features(feature_map)
+        return feature_map
 
     def _maybe_emit_signal(self, market_id: str, recv_ts: datetime, window_id: str | None = None) -> None:
         self.stats["feature_vector_count"] += 1
@@ -988,6 +1064,19 @@ class ShadowRuntime:
         if self.model_type == "executable_net_binary":
             p_up = float(self.model_up.predict_proba(x)[0][1])
             p_down = float(self.model_down.predict_proba(x)[0][1])
+            p_flat = 0.0
+        elif self.model_type == "edge_v3":
+            def edge_predict(bundle: Any) -> tuple[float, float]:
+                raw_p = float(bundle["classifier"].predict_proba(x)[0][1])
+                p = float(bundle["calibrator"].predict([raw_p])[0])
+                edge = float(bundle["regressor"].predict(x)[0])
+                if edge < float(bundle.get("edge_threshold", 0.0)):
+                    return 0.0, edge
+                return p, edge
+            p_up, edge_up = edge_predict(self.model_up)
+            p_down, edge_down = edge_predict(self.model_down)
+            feature_map["pred_edge_up"] = edge_up
+            feature_map["pred_edge_down"] = edge_down
             p_flat = 0.0
         else:
             probs = self.model.predict_proba(x)[0]
@@ -1032,6 +1121,8 @@ class ShadowRuntime:
             "p_up": p_up,
             "p_down": p_down,
             "p_flat": p_flat,
+            "pred_edge_up": feature_map.get("pred_edge_up"),
+            "pred_edge_down": feature_map.get("pred_edge_down"),
             "direction": direction,
             "threshold": threshold,
             "yes_bid": feature_map.get("yes_bid"),

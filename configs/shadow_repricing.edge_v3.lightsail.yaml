@@ -1,0 +1,78 @@
+﻿mode: shadow_no_trade
+enable_trading: false
+
+safety:
+  disable_order_placement: true
+  fail_if_order_api_configured: true
+
+outputs:
+  base_dir: /opt/pm-shadow/data/shadow
+  report_dir: /opt/pm-shadow/reports/shadow
+  flush_interval_seconds: 5
+
+model:
+  type: edge_v3
+  up_model_path: /opt/pm-shadow/repo/models/pm_repricing_edge_v3/edge_v3_lat0_h5_UP.joblib
+  down_model_path: /opt/pm-shadow/repo/models/pm_repricing_edge_v3/edge_v3_lat0_h10_DOWN.joblib
+  features_path: /opt/pm-shadow/repo/models/pm_repricing_edge_v3/features_pm_repricing_edge_v3.json
+  version: pm_repricing_edge_v3
+  fee_rate: 0.07
+  slippage_buffer: 0.0025
+
+market_meta:
+  silver_pm_path: /opt/pm-shadow/repo/configs/shadow_market_meta.parquet
+
+feeds:
+  binance:
+    symbol: BTCUSDT
+    streams:
+      - bookTicker
+      - aggTrade
+    record_raw: true
+
+  polymarket:
+    record_raw: true
+    quote_ttl_seconds: 2.0
+    websocket_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    market_channel: "market"
+    user_channel_enabled: false
+    max_subscribed_markets: 12
+    subscribe_batch_size: 20
+    subscribe_lookback_seconds: 300
+    subscribe_lookahead_seconds: 1800
+    online_metadata_refresh_enabled: true
+    online_metadata_refresh_seconds: 300
+    metadata_refresh_lookback_minutes: 30
+    metadata_refresh_lookahead_hours: 4
+    quote_stale_reconnect_seconds: 120
+
+binance:
+  symbol: BTCUSDT
+  ws_url: wss://stream.binance.com:443/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade
+
+polymarket:
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  subscribe_messages: []
+  market_channel: "market"
+  quote_ttl_seconds: 2.0
+  user_channel_enabled: false
+
+signals:
+  configs:
+    - name: edge_v3_only
+      direction: BOTH
+      up_threshold: 0.65
+      down_threshold: 0.50
+      max_spread: 0.02
+      min_time_to_expiry_seconds: 60
+      cooldown_seconds: 10
+
+simulation:
+  entry_latencies_seconds: [0.0, 0.25, 0.5, 1.0, 2.0]
+  exit_horizons_seconds: [1, 5, 10, 30]
+  stress_costs: [0.0, 0.005, 0.01, 0.02]
+
+dry_run:
+  historical_gold_path: /opt/pm-shadow/repo/configs/shadow_dryrun_gold_sample.parquet
+  max_rows: 5000
+  reset_cooldown_per_row: false
