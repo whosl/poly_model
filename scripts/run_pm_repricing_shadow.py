@@ -20,6 +20,8 @@ import json
 import logging
 import math
 import time
+import urllib.parse
+import urllib.request
 import uuid
 import warnings
 from collections import Counter, deque
@@ -387,6 +389,7 @@ class BinanceState:
     ask_qty: float | None = None
     mid_hist: deque[tuple[datetime, float]] = field(default_factory=deque)
     trade_hist: deque[tuple[datetime, float, float, bool]] = field(default_factory=deque)
+    last_rest_fallback_ts: datetime | None = None
 
     @property
     def mid(self) -> float | None:
@@ -503,6 +506,7 @@ class ShadowRuntime:
         base_shadow = ensure_dir(cfg["output"]["base_dir"])
         self.pm_quote_sink = ParquetBuffer(base_shadow / "pm_quote_state", "pm_quote_state")
         self.binance_sink = ParquetBuffer(base_shadow / "binance_ticks", "binance_ticks")
+        self.candidates_sink = ParquetBuffer(base_shadow / "repricing_candidates", "repricing_candidates")
         self.signals_sink = ParquetBuffer(base_shadow / "repricing_signals", "repricing_signals")
         self.outcomes_sink = ParquetBuffer(base_shadow / "repricing_outcomes", "repricing_outcomes")
         self.latency_sink = ParquetBuffer(base_shadow / "latency_metrics", "latency_metrics")
@@ -515,6 +519,7 @@ class ShadowRuntime:
             "model_inference_count": 0,
             "signal_count": 0,
             "outcome_count": 0,
+            "candidate_count": 0,
             "max_p_up": None,
             "max_p_down": None,
             "p_up_values": [],
@@ -729,6 +734,33 @@ class ShadowRuntime:
                 "ask_qty": self.binance.ask_qty,
             }
         )
+
+    def update_binance_rest_ticker(self, payload: dict[str, Any], recv_ts: datetime) -> None:
+        payload = {
+            "bidPrice": payload.get("bidPrice"),
+            "askPrice": payload.get("askPrice"),
+            "bidQty": payload.get("bidQty"),
+            "askQty": payload.get("askQty"),
+        }
+        before = self.binance.ts_recv
+        self.update_binance_bookticker(payload, recv_ts)
+        if self.binance.ts_recv != before:
+            # Mark the last appended row as a REST fallback with an extra row for audit.
+            self.binance.last_rest_fallback_ts = recv_ts
+            self.binance_sink.append(
+                {
+                    "run_id": self.run_id,
+                    "date": recv_ts.date().isoformat(),
+                    "sample_ts": recv_ts,
+                    "ts_recv": recv_ts,
+                    "stream": "bookTicker_rest_fallback",
+                    "bid": self.binance.bid,
+                    "ask": self.binance.ask,
+                    "mid": self.binance.mid,
+                    "bid_qty": self.binance.bid_qty,
+                    "ask_qty": self.binance.ask_qty,
+                }
+            )
 
     def update_binance_aggtrade(self, payload: dict[str, Any], recv_ts: datetime) -> None:
         try:
@@ -1084,8 +1116,47 @@ class ShadowRuntime:
         infer_end = utc_now() if not self.replay_mode else recv_ts
         self.stats["model_inference_count"] += 1
         self._record_prob_stats(p_up, p_down)
+        self._record_candidate(market_id, recv_ts, feature_map, p_up, p_down, p_flat)
         for cfg in self.signal_configs:
             self._evaluate_config(cfg, market_id, recv_ts, feature_map, p_up, p_down, p_flat, infer_start, infer_end, is_forced_signal=False, window_id=window_id)
+
+    def _record_candidate(self, market_id: str, recv_ts: datetime, feature_map: dict[str, Any], p_up: float, p_down: float, p_flat: float) -> None:
+        cfg = self.cfg.get("candidate_logging", {})
+        if not bool(cfg.get("enabled", True)):
+            return
+        min_prob = float(cfg.get("min_prob", 0.0))
+        min_abs_edge = float(cfg.get("min_abs_edge", -999.0))
+        edge_up = self._num(feature_map.get("pred_edge_up"))
+        edge_down = self._num(feature_map.get("pred_edge_down"))
+        if max(p_up, p_down) < min_prob and max(edge_up or -999.0, edge_down or -999.0) < min_abs_edge:
+            return
+        self.stats["candidate_count"] += 1
+        date_str = recv_ts.date().isoformat()
+        self.candidates_sink.append(
+            {
+                "run_id": self.run_id,
+                "date": date_str,
+                "market_id": market_id,
+                "sample_ts": recv_ts,
+                "model_version": self.cfg["model"].get("version", "unknown"),
+                "p_up": p_up,
+                "p_down": p_down,
+                "p_flat": p_flat,
+                "pred_edge_up": edge_up,
+                "pred_edge_down": edge_down,
+                "yes_bid": feature_map.get("yes_bid"),
+                "yes_ask": feature_map.get("yes_ask"),
+                "no_bid": feature_map.get("no_bid"),
+                "no_ask": feature_map.get("no_ask"),
+                "yes_spread": feature_map.get("yes_spread"),
+                "no_spread": feature_map.get("no_spread"),
+                "time_to_expiry_seconds": feature_map.get("time_to_expiry_seconds"),
+                "quote_age": feature_map.get("seconds_since_last_pm_update"),
+                "btc_quote_age": None if self.binance.ts_recv is None else (recv_ts - self.binance.ts_recv).total_seconds(),
+                "btc_mid": self.binance.mid,
+                "formula_p_yes": feature_map.get("formula_p_yes"),
+            }
+        )
 
     def _emit_signal(
         self,
@@ -1356,6 +1427,7 @@ class ShadowRuntime:
     def finalize(self) -> None:
         self.pm_quote_sink.flush()
         self.binance_sink.flush()
+        self.candidates_sink.flush()
         self.signals_sink.flush()
         self.outcomes_sink.flush()
         self.latency_sink.flush()
@@ -1379,6 +1451,7 @@ class ShadowRuntime:
             "model_inference_count": self.stats["model_inference_count"],
             "signal_count": self.stats["signal_count"],
             "outcome_count": self.stats["outcome_count"],
+            "candidate_count": self.stats.get("candidate_count", 0),
             "filtered_by_reason": filtered,
             "max_p_up": self.stats["max_p_up"],
             "max_p_down": self.stats["max_p_down"],
@@ -1419,6 +1492,37 @@ async def binance_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
                 rt.update_binance_aggtrade(payload, recv_ts)
             if utc_now() >= rt.stop_wall:
                 break
+
+
+def _fetch_binance_bookticker_rest(symbol: str, timeout_seconds: float = 5.0) -> dict[str, Any] | None:
+    params = urllib.parse.urlencode({"symbol": symbol.upper()})
+    url = f"https://api.binance.com/api/v3/ticker/bookTicker?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "pm-shadow-binance-fallback/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+async def binance_rest_fallback_task(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
+    bcfg = _get_nested(cfg, "feeds", "binance", default={}) or {}
+    if not bool(bcfg.get("rest_fallback_enabled", True)):
+        return
+    symbol = str(_get_nested(cfg, "binance", "symbol", default=bcfg.get("symbol", "BTCUSDT")))
+    stale_s = float(bcfg.get("rest_fallback_stale_seconds", 15))
+    poll_s = float(bcfg.get("rest_fallback_poll_seconds", 5))
+    timeout_s = float(bcfg.get("rest_fallback_timeout_seconds", 5))
+    while utc_now() < rt.stop_wall:
+        await asyncio.sleep(max(1.0, poll_s))
+        now = utc_now()
+        age = None if rt.binance.ts_recv is None else (now - rt.binance.ts_recv).total_seconds()
+        if age is not None and age < stale_s:
+            continue
+        try:
+            payload = await asyncio.to_thread(_fetch_binance_bookticker_rest, symbol, timeout_s)
+            if payload:
+                rt.update_binance_rest_ticker(payload, now)
+                LOGGER.warning("Binance REST fallback updated bookTicker; previous_ws_age=%s", age)
+        except Exception as exc:
+            LOGGER.warning("Binance REST fallback failed: %s", exc)
 
 
 def parse_pm_event(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1766,6 +1870,7 @@ async def live_main(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
     tasks = [
         asyncio.create_task(_resilient_feed_task("binance", binance_task, rt, cfg)),
         asyncio.create_task(_resilient_feed_task("polymarket", polymarket_task, rt, cfg)),
+        asyncio.create_task(binance_rest_fallback_task(rt, cfg)),
     ]
     flush_interval = max(1, int(cfg["output"].get("flush_interval_seconds", 10)))
     try:
@@ -1774,6 +1879,7 @@ async def live_main(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
             if int(time.time()) % flush_interval == 0:
                 rt.pm_quote_sink.flush()
                 rt.binance_sink.flush()
+                rt.candidates_sink.flush()
                 rt.signals_sink.flush()
                 rt.outcomes_sink.flush()
                 rt.latency_sink.flush()

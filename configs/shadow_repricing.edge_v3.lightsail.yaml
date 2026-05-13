@@ -29,6 +29,10 @@ feeds:
       - bookTicker
       - aggTrade
     record_raw: true
+    rest_fallback_enabled: true
+    rest_fallback_stale_seconds: 15
+    rest_fallback_poll_seconds: 5
+    rest_fallback_timeout_seconds: 5
 
   polymarket:
     record_raw: true
@@ -71,6 +75,11 @@ simulation:
   entry_latencies_seconds: [0.0, 0.25, 0.5, 1.0, 2.0]
   exit_horizons_seconds: [1, 5, 10, 30]
   stress_costs: [0.0, 0.005, 0.01, 0.02]
+
+candidate_logging:
+  enabled: true
+  min_prob: 0.0
+  min_abs_edge: -999.0
 
 dry_run:
   historical_gold_path: /opt/pm-shadow/repo/configs/shadow_dryrun_gold_sample.parquet
