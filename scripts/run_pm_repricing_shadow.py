@@ -432,6 +432,7 @@ class PendingOutcome:
     threshold: float
     entry_due_ts: datetime
     exit_due_ts: datetime
+    outcome_kind: str = "quote_exit"
     is_forced_signal: bool = False
     p_up: float | None = None
     p_down: float | None = None
@@ -735,6 +736,10 @@ class ShadowRuntime:
                 "ask_qty": self.binance.ask_qty,
             }
         )
+        if self.pending:
+            due_markets = {po.market_id for po in self.pending if po.outcome_kind == "terminal" and recv_ts >= po.exit_due_ts}
+            for pending_market_id in due_markets:
+                self._advance_pending(pending_market_id, recv_ts)
 
     def update_binance_rest_ticker(self, payload: dict[str, Any], recv_ts: datetime) -> None:
         payload = {
@@ -921,13 +926,15 @@ class ShadowRuntime:
         st = self.market_states[market_id]
         if self.binance.mid is None or st.yes.mid is None or st.no.mid is None:
             return None
-        if st.btc_open_price is None:
-            st.btc_open_price = self.binance.mid
         if st.meta.market_end_ts is None or st.meta.market_start_ts is None:
+            return None
+        if recv_ts < st.meta.market_start_ts:
             return None
         tte = (st.meta.market_end_ts - recv_ts).total_seconds()
         if tte <= 0:
             return None
+        if st.btc_open_price is None:
+            st.btc_open_price = self.binance.mid
         elapsed = (recv_ts - st.meta.market_start_ts).total_seconds()
         lag1 = self._lag_value(self.binance.mid_hist, recv_ts, 1)
         lag5 = self._lag_value(self.binance.mid_hist, recv_ts, 5)
@@ -979,11 +986,18 @@ class ShadowRuntime:
             "btc_return_30s": None if lag30 in (None, 0) else (self.binance.mid / lag30 - 1.0),
             "realized_vol_10s": self._rolling_std_logret(self.binance.mid_hist, 10),
             "realized_vol_30s": self._rolling_std_logret(self.binance.mid_hist, 30),
+            "realized_vol_60s": vol60,
             "btc_realized_vol_60s": vol60,
+            "btc_open_price": st.btc_open_price,
+            "btc_current_price": self.binance.mid,
+            "return_since_open": None if st.btc_open_price in (None, 0) else (self.binance.mid / st.btc_open_price - 1.0),
+            "distance_to_open": None if st.btc_open_price is None else (self.binance.mid - st.btc_open_price),
             "formula_p_yes": formula_p_yes,
             "formula_p_yes_minus_yes_mid": formula_p_yes - st.yes.mid,
             "formula_p_yes_minus_yes_ask": None if st.yes.ask is None else formula_p_yes - st.yes.ask,
             "formula_p_no_minus_no_ask": None if st.no.ask is None else (1.0 - formula_p_yes) - st.no.ask,
+            "edge_to_yes_ask": None if st.yes.ask is None else formula_p_yes - st.yes.ask,
+            "edge_to_no_ask": None if st.no.ask is None else (1.0 - formula_p_yes) - st.no.ask,
             "pm_yes_mid_change_1s_past": None if yes_mid_1 is None else st.yes.mid - yes_mid_1,
             "pm_yes_mid_change_5s_past": None if yes_mid_5 is None else st.yes.mid - yes_mid_5,
             "pm_no_mid_change_1s_past": None,
@@ -996,9 +1010,13 @@ class ShadowRuntime:
             "btc_buy_volume_1s": f1["buy"], "btc_sell_volume_1s": f1["sell"], "btc_net_volume_1s": f1["net"], "btc_total_volume_1s": f1["total"], "btc_trade_count_1s": f1["count"], "btc_trade_imbalance_1s": f1["imbalance"],
             "btc_buy_volume_5s": f5["buy"], "btc_sell_volume_5s": f5["sell"], "btc_net_volume_5s": f5["net"], "btc_total_volume_5s": f5["total"], "btc_trade_count_5s": f5["count"], "btc_trade_imbalance_5s": f5["imbalance"],
             "btc_buy_volume_30s": f30["buy"], "btc_sell_volume_30s": f30["sell"], "btc_net_volume_30s": f30["net"], "btc_total_volume_30s": f30["total"], "btc_trade_count_30s": f30["count"], "btc_trade_imbalance_30s": f30["imbalance"],
+            "binance_trade_imbalance_1s": f1["imbalance"],
+            "binance_trade_imbalance_5s": f5["imbalance"],
+            "binance_trade_imbalance_30s": f30["imbalance"],
             "btc_bid_depth_5": btc_bid_depth,
             "btc_ask_depth_5": btc_ask_depth,
             "btc_depth_imbalance_5": btc_di,
+            "binance_depth_imbalance_5": btc_di,
             "latency_seconds": 0,
         }
         self._add_v3_derived_features(feature_map)
@@ -1136,6 +1154,25 @@ class ShadowRuntime:
             feature_map["pred_prob_up_calibrated"] = cal_up
             feature_map["pred_prob_down_calibrated"] = cal_down
             p_flat = 0.0
+        elif self.model_type == "terminal_binary":
+            terminal_p_yes = float(self.model.predict_proba(x)[0][1])
+            yes_ask = self._num(feature_map.get("yes_ask"))
+            no_ask = self._num(feature_map.get("no_ask"))
+            fee_rate = float(self.cfg["model"].get("fee_rate", 0.07))
+            slip = float(self.cfg["model"].get("slippage_buffer", 0.0025))
+            if yes_ask is None or no_ask is None:
+                self.stats["filtered_by_reason"]["feature_not_ready"] += 1
+                return
+            yes_fee = fee_rate * yes_ask * (1.0 - yes_ask)
+            no_fee = fee_rate * no_ask * (1.0 - no_ask)
+            p_up = float(terminal_p_yes - yes_ask - yes_fee - slip)
+            p_down = float((1.0 - terminal_p_yes) - no_ask - no_fee - slip)
+            p_flat = 0.0
+            feature_map["terminal_p_yes"] = terminal_p_yes
+            feature_map["terminal_edge_yes"] = p_up
+            feature_map["terminal_edge_no"] = p_down
+            feature_map["pred_edge_up"] = p_up
+            feature_map["pred_edge_down"] = p_down
         else:
             probs = self.model.predict_proba(x)[0]
             p_down, p_flat, p_up = float(probs[0]), float(probs[1]), float(probs[2])
@@ -1174,6 +1211,10 @@ class ShadowRuntime:
                 "pred_prob_down_raw": feature_map.get("pred_prob_down_raw"),
                 "pred_prob_up_calibrated": feature_map.get("pred_prob_up_calibrated"),
                 "pred_prob_down_calibrated": feature_map.get("pred_prob_down_calibrated"),
+                "terminal_p_yes": feature_map.get("terminal_p_yes"),
+                "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
+                "terminal_edge_no": feature_map.get("terminal_edge_no"),
+                "btc_open_price": feature_map.get("btc_open_price"),
                 "yes_bid": feature_map.get("yes_bid"),
                 "yes_ask": feature_map.get("yes_ask"),
                 "no_bid": feature_map.get("no_bid"),
@@ -1228,6 +1269,10 @@ class ShadowRuntime:
             "pred_prob_down_raw": feature_map.get("pred_prob_down_raw"),
             "pred_prob_up_calibrated": feature_map.get("pred_prob_up_calibrated"),
             "pred_prob_down_calibrated": feature_map.get("pred_prob_down_calibrated"),
+            "terminal_p_yes": feature_map.get("terminal_p_yes"),
+            "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
+            "terminal_edge_no": feature_map.get("terminal_edge_no"),
+            "btc_open_price": feature_map.get("btc_open_price"),
             "direction": direction,
             "threshold": threshold,
             "yes_bid": feature_map.get("yes_bid"),
@@ -1267,8 +1312,18 @@ class ShadowRuntime:
                 "quote_age_ms": None if self.market_states[market_id].last_pm_update_ts is None else (local_signal_ts - self.market_states[market_id].last_pm_update_ts).total_seconds() * 1000.0,
             }
         )
+        terminal_mode = self.model_type == "terminal_binary"
+        terminal_exit_ts = self.market_states[market_id].meta.market_end_ts
         for latency_ms in ENTRY_LATENCIES_MS:
-            for horizon_s in EXIT_HORIZONS_S:
+            if terminal_mode:
+                exit_due = (terminal_exit_ts or recv_ts) + timedelta(seconds=2)
+                horizons = [(-1, exit_due, "terminal")]
+            else:
+                horizons = [
+                    (horizon_s, recv_ts + timedelta(milliseconds=latency_ms, seconds=horizon_s), "quote_exit")
+                    for horizon_s in EXIT_HORIZONS_S
+                ]
+            for horizon_s, exit_due, outcome_kind in horizons:
                 self.pending.append(
                     PendingOutcome(
                         signal_id=signal_id,
@@ -1283,7 +1338,8 @@ class ShadowRuntime:
                         exit_horizon_seconds=horizon_s,
                         threshold=threshold,
                         entry_due_ts=recv_ts + timedelta(milliseconds=latency_ms),
-                        exit_due_ts=recv_ts + timedelta(milliseconds=latency_ms, seconds=horizon_s),
+                        exit_due_ts=exit_due,
+                        outcome_kind=outcome_kind,
                         is_forced_signal=is_forced_signal,
                         p_up=p_up,
                         p_down=p_down,
@@ -1398,11 +1454,22 @@ class ShadowRuntime:
                 po.entry_price = quote.ask
             if po.entry_price is not None and po.exit_price is None and recv_ts >= po.exit_due_ts:
                 po.simulated_exit_ts = recv_ts
-                po.exit_quote_ts = quote.ts_event
-                po.exit_quote_available = quote.bid is not None
-                po.exit_quote_stale = bool(quote.is_stale)
-                po.exit_crossed_quote = quote.crossed
-                po.exit_price = quote.bid
+                if po.outcome_kind == "terminal":
+                    settled_yes = None
+                    if self.binance.mid is not None and st.btc_open_price is not None:
+                        settled_yes = 1.0 if self.binance.mid > st.btc_open_price else 0.0
+                    po.exit_quote_ts = recv_ts if settled_yes is not None else None
+                    po.exit_quote_available = settled_yes is not None
+                    po.exit_quote_stale = False
+                    po.exit_crossed_quote = False
+                    if settled_yes is not None:
+                        po.exit_price = settled_yes if po.direction == "UP" else (1.0 - settled_yes)
+                else:
+                    po.exit_quote_ts = quote.ts_event
+                    po.exit_quote_available = quote.bid is not None
+                    po.exit_quote_stale = bool(quote.is_stale)
+                    po.exit_crossed_quote = quote.crossed
+                    po.exit_price = quote.bid
             if po.exit_price is not None or recv_ts > po.exit_due_ts + timedelta(seconds=2):
                 pnl = None
                 roi = None
@@ -1415,7 +1482,10 @@ class ShadowRuntime:
                     fee_rate = float(self.cfg["model"].get("fee_rate", 0.07))
                     slip = float(self.cfg["model"].get("slippage_buffer", 0.0025))
                     entry_fee = fee_rate * po.entry_price * (1.0 - po.entry_price)
-                    exit_fee = fee_rate * po.exit_price * (1.0 - po.exit_price)
+                    if po.outcome_kind == "terminal":
+                        exit_fee = 0.0
+                    else:
+                        exit_fee = fee_rate * po.exit_price * (1.0 - po.exit_price)
                     net_pnl = float(pnl - entry_fee - exit_fee - slip)
                 self.stats["outcome_count"] += 1
                 self.outcomes_sink.append(
@@ -1431,12 +1501,16 @@ class ShadowRuntime:
                         "signal_ts": po.signal_ts,
                         "entry_latency_ms": po.latency_ms,
                         "exit_horizon_seconds": po.exit_horizon_seconds,
+                        "outcome_kind": po.outcome_kind,
                         "simulated_entry_ts": po.simulated_entry_ts,
                         "simulated_exit_ts": po.simulated_exit_ts,
                         "entry_quote_ts": po.entry_quote_ts,
                         "entry_price": po.entry_price,
                         "exit_quote_ts": po.exit_quote_ts,
                         "exit_price": po.exit_price,
+                        "btc_open_price": st.btc_open_price,
+                        "btc_settlement_price": self.binance.mid if po.outcome_kind == "terminal" else None,
+                        "settled_yes": (None if po.outcome_kind != "terminal" or po.exit_price is None else (po.exit_price if po.direction == "UP" else 1.0 - po.exit_price)),
                         "pnl": pnl,
                         "roi": roi,
                         "entry_fee": entry_fee,
