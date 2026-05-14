@@ -1124,9 +1124,17 @@ class ShadowRuntime:
                     return 0.0, edge
                 return p, edge
             p_up, edge_up = edge_predict(self.model_up)
+            raw_up = float(self.model_up["classifier"].predict_proba(x)[0][1])
+            cal_up = float(self.model_up["calibrator"].predict([raw_up])[0])
             p_down, edge_down = edge_predict(self.model_down)
+            raw_down = float(self.model_down["classifier"].predict_proba(x)[0][1])
+            cal_down = float(self.model_down["calibrator"].predict([raw_down])[0])
             feature_map["pred_edge_up"] = edge_up
             feature_map["pred_edge_down"] = edge_down
+            feature_map["pred_prob_up_raw"] = raw_up
+            feature_map["pred_prob_down_raw"] = raw_down
+            feature_map["pred_prob_up_calibrated"] = cal_up
+            feature_map["pred_prob_down_calibrated"] = cal_down
             p_flat = 0.0
         else:
             probs = self.model.predict_proba(x)[0]
@@ -1162,6 +1170,10 @@ class ShadowRuntime:
                 "p_flat": p_flat,
                 "pred_edge_up": edge_up,
                 "pred_edge_down": edge_down,
+                "pred_prob_up_raw": feature_map.get("pred_prob_up_raw"),
+                "pred_prob_down_raw": feature_map.get("pred_prob_down_raw"),
+                "pred_prob_up_calibrated": feature_map.get("pred_prob_up_calibrated"),
+                "pred_prob_down_calibrated": feature_map.get("pred_prob_down_calibrated"),
                 "yes_bid": feature_map.get("yes_bid"),
                 "yes_ask": feature_map.get("yes_ask"),
                 "no_bid": feature_map.get("no_bid"),
@@ -1212,6 +1224,10 @@ class ShadowRuntime:
             "p_flat": p_flat,
             "pred_edge_up": feature_map.get("pred_edge_up"),
             "pred_edge_down": feature_map.get("pred_edge_down"),
+            "pred_prob_up_raw": feature_map.get("pred_prob_up_raw"),
+            "pred_prob_down_raw": feature_map.get("pred_prob_down_raw"),
+            "pred_prob_up_calibrated": feature_map.get("pred_prob_up_calibrated"),
+            "pred_prob_down_calibrated": feature_map.get("pred_prob_down_calibrated"),
             "direction": direction,
             "threshold": threshold,
             "yes_bid": feature_map.get("yes_bid"),
