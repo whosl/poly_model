@@ -156,6 +156,14 @@ def normalize_shadow_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
                 "threshold_down": item.get("threshold_down", item.get("down_threshold")),
                 "max_spread": item.get("max_spread"),
                 "min_tte": item.get("min_tte", item.get("min_time_to_expiry_seconds", 0)),
+                "max_tte": item.get("max_tte", item.get("max_time_to_expiry_seconds")),
+                "max_pair_ask_sum": item.get("max_pair_ask_sum"),
+                "max_quote_age_seconds": item.get("max_quote_age_seconds"),
+                "max_seconds_since_pm_update": item.get("max_seconds_since_pm_update"),
+                "min_ask_depth_5": item.get("min_ask_depth_5"),
+                "max_depth_fraction": item.get("max_depth_fraction"),
+                "order_size_shares": item.get("order_size_shares"),
+                "min_cost_adjusted_edge": item.get("min_cost_adjusted_edge"),
                 "cooldown_seconds": item.get("cooldown_seconds", 10),
             }
         )
@@ -367,6 +375,14 @@ class ShadowSignalConfig:
     threshold_down: float | None = None
     max_spread: float | None = None
     min_tte: float = 0.0
+    max_tte: float | None = None
+    max_pair_ask_sum: float | None = None
+    max_quote_age_seconds: float | None = None
+    max_seconds_since_pm_update: float | None = None
+    min_ask_depth_5: float | None = None
+    max_depth_fraction: float | None = None
+    order_size_shares: float | None = None
+    min_cost_adjusted_edge: float | None = None
     cooldown_seconds: float = 10.0
 
 
@@ -391,6 +407,7 @@ class QuoteSnapshot:
     ask_levels: list[tuple[float, float]] = field(default_factory=list)
     ts_event: datetime | None = None
     ts_recv: datetime | None = None
+    event_lag_seconds: float | None = None
     crossed: bool = False
     quote_age_seconds: float | None = None
     is_stale: bool = False
@@ -922,7 +939,13 @@ class ShadowRuntime:
         q.crossed = bool(q.bid is not None and q.ask is not None and q.bid > q.ask)
         q.quote_age_seconds = 0.0
         q.is_stale = False
-        st.last_pm_update_ts = event_ts
+        q.event_lag_seconds = max(0.0, (recv_ts - event_ts).total_seconds())
+        # For live trading/shadow freshness gates use the local receive time, not
+        # the exchange payload timestamp. Polymarket's market-channel orderbook
+        # snapshots often carry the last book event timestamp; the book can still
+        # be freshly received even if that timestamp is many seconds old. Keep the
+        # event timestamp/lag for audit, but do not treat it as transport staleness.
+        st.last_pm_update_ts = recv_ts
         st.last_sample_ts = recv_ts
         if st.yes.mid is not None:
             st.pm_mid_hist.append((event_ts, st.yes.mid))
@@ -939,6 +962,7 @@ class ShadowRuntime:
                 "side": side,
                 "sample_ts": event_ts,
                 "ts_recv": recv_ts,
+                "event_lag_seconds": q.event_lag_seconds,
                 "best_bid": q.bid,
                 "best_ask": q.ask,
                 "mid": q.mid,
@@ -1060,9 +1084,9 @@ class ShadowRuntime:
             "pm_yes_mid_change_5s_past": None if yes_mid_5 is None else st.yes.mid - yes_mid_5,
             "pm_no_mid_change_1s_past": None,
             "pm_no_mid_change_5s_past": None,
-            "seconds_since_last_pm_update": None if st.last_pm_update_ts is None else (recv_ts - st.last_pm_update_ts).total_seconds(),
-            "yes_quote_age_seconds": None if st.yes.ts_event is None else max(0.0, (recv_ts - st.yes.ts_event).total_seconds()),
-            "no_quote_age_seconds": None if st.no.ts_event is None else max(0.0, (recv_ts - st.no.ts_event).total_seconds()),
+            "seconds_since_last_pm_update": None if st.last_pm_update_ts is None else max(0.0, (recv_ts - st.last_pm_update_ts).total_seconds()),
+            "yes_quote_age_seconds": None if st.yes.ts_recv is None else max(0.0, (recv_ts - st.yes.ts_recv).total_seconds()),
+            "no_quote_age_seconds": None if st.no.ts_recv is None else max(0.0, (recv_ts - st.no.ts_recv).total_seconds()),
             "btc_spread": btc_spread,
             "btc_microprice_minus_mid": btc_micro,
             "btc_buy_volume_1s": f1["buy"], "btc_sell_volume_1s": f1["sell"], "btc_net_volume_1s": f1["net"], "btc_total_volume_1s": f1["total"], "btc_trade_count_1s": f1["count"], "btc_trade_imbalance_1s": f1["imbalance"],
@@ -1337,6 +1361,10 @@ class ShadowRuntime:
                 "no_spread": feature_map.get("no_spread"),
                 "time_to_expiry_seconds": feature_map.get("time_to_expiry_seconds"),
                 "quote_age": feature_map.get("seconds_since_last_pm_update"),
+                "yes_recv_age": feature_map.get("yes_quote_age_seconds"),
+                "no_recv_age": feature_map.get("no_quote_age_seconds"),
+                "yes_event_lag_seconds": self.market_states[market_id].yes.event_lag_seconds,
+                "no_event_lag_seconds": self.market_states[market_id].no.event_lag_seconds,
                 "btc_quote_age": None if self.binance.ts_recv is None else (recv_ts - self.binance.ts_recv).total_seconds(),
                 "btc_mid": self.binance.mid,
                 "formula_p_yes": feature_map.get("formula_p_yes"),
@@ -1429,6 +1457,11 @@ class ShadowRuntime:
             "no_effective_worst_ask_6sh": feature_map.get("no_effective_worst_ask_6sh"),
             "direction": direction,
             "threshold": threshold,
+            "time_to_expiry_seconds": feature_map.get("time_to_expiry_seconds"),
+            "market_start_ts": self.market_states[market_id].meta.market_start_ts,
+            "market_end_ts": self.market_states[market_id].meta.market_end_ts,
+            "yes_asset_id": self.market_states[market_id].meta.yes_asset_id,
+            "no_asset_id": self.market_states[market_id].meta.no_asset_id,
             "yes_bid": feature_map.get("yes_bid"),
             "yes_ask": feature_map.get("yes_ask"),
             "no_bid": feature_map.get("no_bid"),
@@ -1525,6 +1558,23 @@ class ShadowRuntime:
         if tte < cfg.min_tte:
             self.stats["filtered_by_reason"]["tte_too_low"] += 1
             return
+        if cfg.max_tte is not None and tte > float(cfg.max_tte):
+            self.stats["filtered_by_reason"]["tte_too_high"] += 1
+            return
+        pair_ask_sum = self._num(feature_map.get("pair_ask_sum"))
+        if cfg.max_pair_ask_sum is not None and (pair_ask_sum is None or pair_ask_sum > float(cfg.max_pair_ask_sum)):
+            self.stats["filtered_by_reason"]["pair_ask_sum_too_high"] += 1
+            return
+        seconds_since_update = self._num(feature_map.get("seconds_since_last_pm_update"))
+        if cfg.max_seconds_since_pm_update is not None and (seconds_since_update is None or seconds_since_update > float(cfg.max_seconds_since_pm_update)):
+            self.stats["filtered_by_reason"]["pm_update_too_old"] += 1
+            return
+        if cfg.max_quote_age_seconds is not None:
+            yes_age = self._num(feature_map.get("yes_quote_age_seconds"))
+            no_age = self._num(feature_map.get("no_quote_age_seconds"))
+            if yes_age is None or no_age is None or yes_age > float(cfg.max_quote_age_seconds) or no_age > float(cfg.max_quote_age_seconds):
+                self.stats["filtered_by_reason"]["quote_age_too_old"] += 1
+                return
         candidates: list[tuple[str, float]] = []
         if cfg.direction in {"UP", "BOTH"} and cfg.threshold_up is not None:
             if p_up >= cfg.threshold_up or is_forced_signal:
@@ -1541,6 +1591,19 @@ class ShadowRuntime:
             if spread is None or (cfg.max_spread is not None and spread > cfg.max_spread):
                 self.stats["filtered_by_reason"]["spread_too_wide"] += 1
                 continue
+            ask_depth = self._num(feature_map.get("yes_ask_depth_5" if direction == "UP" else "no_ask_depth_5"))
+            order_size = float(cfg.order_size_shares if cfg.order_size_shares is not None else self.cfg["model"].get("target_shares", 1.0))
+            if cfg.min_ask_depth_5 is not None and (ask_depth is None or ask_depth < float(cfg.min_ask_depth_5)):
+                self.stats["filtered_by_reason"]["ask_depth_too_low"] += 1
+                continue
+            if cfg.max_depth_fraction is not None and (ask_depth is None or ask_depth * float(cfg.max_depth_fraction) < order_size):
+                self.stats["filtered_by_reason"]["order_too_large_for_depth"] += 1
+                continue
+            if cfg.min_cost_adjusted_edge is not None:
+                edge = p_up if direction == "UP" else p_down
+                if edge < float(cfg.min_cost_adjusted_edge):
+                    self.stats["filtered_by_reason"]["cost_adjusted_edge_too_low"] += 1
+                    continue
             cool_key = (cfg.name, market_id, direction)
             last = self.last_signal_ts.get(cool_key)
             if last is not None and (recv_ts - last).total_seconds() < cfg.cooldown_seconds:
