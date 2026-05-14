@@ -177,6 +177,7 @@ def normalize_shadow_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
             "down_model_path": model_section.get("down_model_path"),
             "fee_rate": float(model_section.get("fee_rate", 0.07)),
             "slippage_buffer": float(model_section.get("slippage_buffer", 0.0025)),
+            "target_shares": float(model_section.get("target_shares", 1.0)),
         },
         "market_meta": {
             "silver_pm_path": _get_nested(cfg, "market_meta", "silver_pm_path", default="data/silver/pm_1s"),
@@ -304,6 +305,42 @@ def depth_sum(levels: Any, side: str, n: int = 5) -> float | None:
     return float(sum(size for _price, size in vals[:n]))
 
 
+
+
+def effective_take_price(levels: Any, side: str, shares: float, fallback_price: float | None = None, fallback_size: float | None = None) -> tuple[float | None, float, bool, float | None]:
+    """Return average fill price for taking `shares` from an order book side.
+
+    side="ask" means buying from asks sorted low-to-high; side="bid" means selling into bids
+    sorted high-to-low. Returns (avg_price, filled_shares, fully_filled, worst_price).
+    """
+    if shares <= 0:
+        return None, 0.0, False, None
+    vals = _parse_levels(levels)
+    if not vals and fallback_price is not None:
+        size = shares if fallback_size is None else max(0.0, float(fallback_size))
+        vals = [(float(fallback_price), size)]
+    if not vals:
+        return None, 0.0, False, None
+    vals.sort(key=lambda x: x[0], reverse=(side == "bid"))
+    remaining = float(shares)
+    notional = 0.0
+    filled = 0.0
+    worst = None
+    for price, size in vals:
+        if remaining <= 1e-12:
+            break
+        take = min(remaining, max(0.0, float(size)))
+        if take <= 0:
+            continue
+        notional += float(price) * take
+        filled += take
+        remaining -= take
+        worst = float(price)
+    if filled <= 0:
+        return None, 0.0, False, None
+    return float(notional / filled), float(filled), bool(filled + 1e-9 >= shares), worst
+
+
 def to_utc_ts(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -350,6 +387,8 @@ class QuoteSnapshot:
     ask_size: float | None = None
     bid_depth_5: float | None = None
     ask_depth_5: float | None = None
+    bid_levels: list[tuple[float, float]] = field(default_factory=list)
+    ask_levels: list[tuple[float, float]] = field(default_factory=list)
     ts_event: datetime | None = None
     ts_recv: datetime | None = None
     crossed: bool = False
@@ -512,7 +551,9 @@ class ShadowRuntime:
         self.signals_sink = ParquetBuffer(base_shadow / "repricing_signals", "repricing_signals")
         self.outcomes_sink = ParquetBuffer(base_shadow / "repricing_outcomes", "repricing_outcomes")
         self.latency_sink = ParquetBuffer(base_shadow / "latency_metrics", "latency_metrics")
+        self.live_samples_sink = ParquetBuffer(base_shadow / "live_model_samples", "live_model_samples")
         self.diagnostics_dir = ensure_dir(base_shadow / "run_diagnostics")
+        self.last_live_sample_ts: dict[str, datetime] = {}
 
         self.stats: dict[str, Any] = {
             "quote_snapshot_count": 0,
@@ -862,8 +903,10 @@ class ShadowRuntime:
         bid = event.get("best_bid")
         ask = event.get("best_ask")
         if "bids" in event:
+            q.bid_levels = sorted(_parse_levels(event.get("bids")), key=lambda x: x[0], reverse=True)
             q.bid_depth_5 = depth_sum(event.get("bids"), "bid", 5)
         if "asks" in event:
+            q.ask_levels = sorted(_parse_levels(event.get("asks")), key=lambda x: x[0])
             q.ask_depth_5 = depth_sum(event.get("asks"), "ask", 5)
         if bid is None and "bids" in event:
             bid, q.bid_size = best_levels(event.get("bids"), "bid")
@@ -902,6 +945,10 @@ class ShadowRuntime:
                 "spread": q.spread,
                 "bid_depth_5": q.bid_depth_5,
                 "ask_depth_5": q.ask_depth_5,
+                "bid_size": q.bid_size,
+                "ask_size": q.ask_size,
+                "bid_levels_json": json.dumps(q.bid_levels[:10]),
+                "ask_levels_json": json.dumps(q.ask_levels[:10]),
                 "crossed_quote": q.crossed,
             }
         )
@@ -958,15 +1005,26 @@ class ShadowRuntime:
             btc_micro = micro - self.binance.mid
         vol60 = self._rolling_std_logret(self.binance.mid_hist, 60)
         formula_p_yes = self._formula_p_yes(self.binance.mid, st.btc_open_price, vol60, tte) or 0.5
+        target_shares = float(self.cfg["model"].get("target_shares", 1.0))
+        yes_eff_ask, yes_eff_fill, yes_eff_ok, yes_eff_worst = effective_take_price(st.yes.ask_levels, "ask", target_shares, st.yes.ask, st.yes.ask_size)
+        no_eff_ask, no_eff_fill, no_eff_ok, no_eff_worst = effective_take_price(st.no.ask_levels, "ask", target_shares, st.no.ask, st.no.ask_size)
         feature_map = {
             "time_to_expiry_seconds": tte,
             "time_elapsed_seconds": elapsed,
             "yes_bid": st.yes.bid,
             "yes_ask": st.yes.ask,
             "yes_mid": st.yes.mid,
+            "yes_effective_ask_6sh": yes_eff_ask,
+            "yes_effective_fill_6sh": yes_eff_fill,
+            "yes_effective_full_6sh": float(1.0 if yes_eff_ok else 0.0),
+            "yes_effective_worst_ask_6sh": yes_eff_worst,
             "no_bid": st.no.bid,
             "no_ask": st.no.ask,
             "no_mid": st.no.mid,
+            "no_effective_ask_6sh": no_eff_ask,
+            "no_effective_fill_6sh": no_eff_fill,
+            "no_effective_full_6sh": float(1.0 if no_eff_ok else 0.0),
+            "no_effective_worst_ask_6sh": no_eff_worst,
             "yes_spread": st.yes.spread,
             "no_spread": st.no.spread,
             "yes_bid_depth_5": st.yes.bid_depth_5,
@@ -1156,17 +1214,19 @@ class ShadowRuntime:
             p_flat = 0.0
         elif self.model_type == "terminal_binary":
             terminal_p_yes = float(self.model.predict_proba(x)[0][1])
-            yes_ask = self._num(feature_map.get("yes_ask"))
-            no_ask = self._num(feature_map.get("no_ask"))
+            yes_ask = self._num(feature_map.get("yes_effective_ask_6sh") or feature_map.get("yes_ask"))
+            no_ask = self._num(feature_map.get("no_effective_ask_6sh") or feature_map.get("no_ask"))
             fee_rate = float(self.cfg["model"].get("fee_rate", 0.07))
             slip = float(self.cfg["model"].get("slippage_buffer", 0.0025))
+            yes_full = bool(feature_map.get("yes_effective_full_6sh", 1.0))
+            no_full = bool(feature_map.get("no_effective_full_6sh", 1.0))
             if yes_ask is None or no_ask is None:
                 self.stats["filtered_by_reason"]["feature_not_ready"] += 1
                 return
             yes_fee = fee_rate * yes_ask * (1.0 - yes_ask)
             no_fee = fee_rate * no_ask * (1.0 - no_ask)
-            p_up = float(terminal_p_yes - yes_ask - yes_fee - slip)
-            p_down = float((1.0 - terminal_p_yes) - no_ask - no_fee - slip)
+            p_up = float(terminal_p_yes - yes_ask - yes_fee - slip) if yes_full else -999.0
+            p_down = float((1.0 - terminal_p_yes) - no_ask - no_fee - slip) if no_full else -999.0
             p_flat = 0.0
             feature_map["terminal_p_yes"] = terminal_p_yes
             feature_map["terminal_edge_yes"] = p_up
@@ -1180,8 +1240,56 @@ class ShadowRuntime:
         self.stats["model_inference_count"] += 1
         self._record_prob_stats(p_up, p_down)
         self._record_candidate(market_id, recv_ts, feature_map, p_up, p_down, p_flat)
+        self._record_live_model_sample(market_id, recv_ts, feature_map, p_up, p_down, p_flat)
         for cfg in self.signal_configs:
             self._evaluate_config(cfg, market_id, recv_ts, feature_map, p_up, p_down, p_flat, infer_start, infer_end, is_forced_signal=False, window_id=window_id)
+
+    def _record_live_model_sample(self, market_id: str, recv_ts: datetime, feature_map: dict[str, Any], p_up: float, p_down: float, p_flat: float) -> None:
+        cfg = self.cfg.get("live_data_collection", {})
+        if not bool(cfg.get("enabled", True)):
+            return
+        interval = float(cfg.get("sample_interval_seconds", 1.0))
+        last = self.last_live_sample_ts.get(market_id)
+        if last is not None and (recv_ts - last).total_seconds() < interval:
+            return
+        self.last_live_sample_ts[market_id] = recv_ts
+        st = self.market_states[market_id]
+        feature_payload = {name: feature_map.get(name) for name in self.feature_names}
+        date_str = recv_ts.date().isoformat()
+        self.live_samples_sink.append(
+            {
+                "run_id": self.run_id,
+                "date": date_str,
+                "sample_id": uuid.uuid4().hex,
+                "market_id": market_id,
+                "sample_ts": recv_ts,
+                "market_start_ts": st.meta.market_start_ts,
+                "market_end_ts": st.meta.market_end_ts,
+                "model_version": self.cfg["model"].get("version", "unknown"),
+                "model_type": self.model_type,
+                "target_shares": float(self.cfg["model"].get("target_shares", 1.0)),
+                "p_up": p_up,
+                "p_down": p_down,
+                "p_flat": p_flat,
+                "terminal_p_yes": feature_map.get("terminal_p_yes"),
+                "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
+                "terminal_edge_no": feature_map.get("terminal_edge_no"),
+                "yes_bid": feature_map.get("yes_bid"),
+                "yes_ask": feature_map.get("yes_ask"),
+                "no_bid": feature_map.get("no_bid"),
+                "no_ask": feature_map.get("no_ask"),
+                "yes_effective_ask_6sh": feature_map.get("yes_effective_ask_6sh"),
+                "no_effective_ask_6sh": feature_map.get("no_effective_ask_6sh"),
+                "yes_effective_fill_6sh": feature_map.get("yes_effective_fill_6sh"),
+                "no_effective_fill_6sh": feature_map.get("no_effective_fill_6sh"),
+                "yes_effective_worst_ask_6sh": feature_map.get("yes_effective_worst_ask_6sh"),
+                "no_effective_worst_ask_6sh": feature_map.get("no_effective_worst_ask_6sh"),
+                "btc_open_price": feature_map.get("btc_open_price"),
+                "btc_current_price": feature_map.get("btc_current_price"),
+                "time_to_expiry_seconds": feature_map.get("time_to_expiry_seconds"),
+                "feature_json": json.dumps(feature_payload, default=str, separators=(",", ":")),
+            }
+        )
 
     def _record_candidate(self, market_id: str, recv_ts: datetime, feature_map: dict[str, Any], p_up: float, p_down: float, p_flat: float) -> None:
         cfg = self.cfg.get("candidate_logging", {})
@@ -1215,6 +1323,12 @@ class ShadowRuntime:
                 "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
                 "terminal_edge_no": feature_map.get("terminal_edge_no"),
                 "btc_open_price": feature_map.get("btc_open_price"),
+                "yes_effective_ask_6sh": feature_map.get("yes_effective_ask_6sh"),
+                "no_effective_ask_6sh": feature_map.get("no_effective_ask_6sh"),
+                "yes_effective_fill_6sh": feature_map.get("yes_effective_fill_6sh"),
+                "no_effective_fill_6sh": feature_map.get("no_effective_fill_6sh"),
+                "yes_effective_worst_ask_6sh": feature_map.get("yes_effective_worst_ask_6sh"),
+                "no_effective_worst_ask_6sh": feature_map.get("no_effective_worst_ask_6sh"),
                 "yes_bid": feature_map.get("yes_bid"),
                 "yes_ask": feature_map.get("yes_ask"),
                 "no_bid": feature_map.get("no_bid"),
@@ -1228,6 +1342,40 @@ class ShadowRuntime:
                 "formula_p_yes": feature_map.get("formula_p_yes"),
             }
         )
+        # Also persist a sampled model-observation row for live model improvement.
+        # This is intentionally tied to candidate logging, which is already known to flush reliably.
+        live_cfg = self.cfg.get("live_data_collection", {})
+        if bool(live_cfg.get("enabled", True)):
+            feature_payload = {name: feature_map.get(name) for name in self.feature_names}
+            self.live_samples_sink.append(
+                {
+                    "run_id": self.run_id,
+                    "date": date_str,
+                    "sample_id": uuid.uuid4().hex,
+                    "market_id": market_id,
+                    "sample_ts": recv_ts,
+                    "market_start_ts": self.market_states[market_id].meta.market_start_ts,
+                    "market_end_ts": self.market_states[market_id].meta.market_end_ts,
+                    "model_version": self.cfg["model"].get("version", "unknown"),
+                    "target_shares": float(self.cfg["model"].get("target_shares", 1.0)),
+                    "p_up": p_up,
+                    "p_down": p_down,
+                    "p_flat": p_flat,
+                    "terminal_p_yes": feature_map.get("terminal_p_yes"),
+                    "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
+                    "terminal_edge_no": feature_map.get("terminal_edge_no"),
+                    "yes_ask": feature_map.get("yes_ask"),
+                    "no_ask": feature_map.get("no_ask"),
+                    "yes_effective_ask_6sh": feature_map.get("yes_effective_ask_6sh"),
+                    "no_effective_ask_6sh": feature_map.get("no_effective_ask_6sh"),
+                    "yes_effective_fill_6sh": feature_map.get("yes_effective_fill_6sh"),
+                    "no_effective_fill_6sh": feature_map.get("no_effective_fill_6sh"),
+                    "btc_open_price": feature_map.get("btc_open_price"),
+                    "btc_current_price": feature_map.get("btc_current_price"),
+                    "time_to_expiry_seconds": feature_map.get("time_to_expiry_seconds"),
+                    "feature_json": json.dumps(feature_payload, default=str, separators=(",", ":")),
+                }
+            )
 
     def _emit_signal(
         self,
@@ -1273,6 +1421,12 @@ class ShadowRuntime:
             "terminal_edge_yes": feature_map.get("terminal_edge_yes"),
             "terminal_edge_no": feature_map.get("terminal_edge_no"),
             "btc_open_price": feature_map.get("btc_open_price"),
+            "yes_effective_ask_6sh": feature_map.get("yes_effective_ask_6sh"),
+            "no_effective_ask_6sh": feature_map.get("no_effective_ask_6sh"),
+            "yes_effective_fill_6sh": feature_map.get("yes_effective_fill_6sh"),
+            "no_effective_fill_6sh": feature_map.get("no_effective_fill_6sh"),
+            "yes_effective_worst_ask_6sh": feature_map.get("yes_effective_worst_ask_6sh"),
+            "no_effective_worst_ask_6sh": feature_map.get("no_effective_worst_ask_6sh"),
             "direction": direction,
             "threshold": threshold,
             "yes_bid": feature_map.get("yes_bid"),
@@ -1448,10 +1602,16 @@ class ShadowRuntime:
             if po.entry_price is None and recv_ts >= po.entry_due_ts:
                 po.simulated_entry_ts = recv_ts
                 po.entry_quote_ts = quote.ts_event
-                po.entry_quote_available = quote.ask is not None
+                target_shares = float(self.cfg["model"].get("target_shares", 1.0))
+                if po.outcome_kind == "terminal":
+                    eff_price, eff_fill, eff_full, _eff_worst = effective_take_price(quote.ask_levels, "ask", target_shares, quote.ask, quote.ask_size)
+                    po.entry_quote_available = bool(eff_price is not None and eff_full)
+                    po.entry_price = eff_price if eff_full else None
+                else:
+                    po.entry_quote_available = quote.ask is not None
+                    po.entry_price = quote.ask
                 po.entry_quote_stale = bool(quote.is_stale)
                 po.entry_crossed_quote = quote.crossed
-                po.entry_price = quote.ask
             if po.entry_price is not None and po.exit_price is None and recv_ts >= po.exit_due_ts:
                 po.simulated_exit_ts = recv_ts
                 if po.outcome_kind == "terminal":
@@ -1516,6 +1676,8 @@ class ShadowRuntime:
                         "entry_fee": entry_fee,
                         "exit_fee": exit_fee,
                         "net_pnl": net_pnl,
+                        "target_shares": float(self.cfg["model"].get("target_shares", 1.0)),
+                        "net_pnl_total": None if net_pnl is None else net_pnl * float(self.cfg["model"].get("target_shares", 1.0)),
                         "entry_quote_available": po.entry_quote_available,
                         "exit_quote_available": po.exit_quote_available,
                         "entry_quote_stale": po.entry_quote_stale,
@@ -1539,6 +1701,7 @@ class ShadowRuntime:
         self.signals_sink.flush()
         self.outcomes_sink.flush()
         self.latency_sink.flush()
+        self.live_samples_sink.flush()
         self._write_diagnostics()
 
     def _write_diagnostics(self) -> None:
@@ -1991,6 +2154,7 @@ async def live_main(rt: ShadowRuntime, cfg: dict[str, Any]) -> None:
                 rt.signals_sink.flush()
                 rt.outcomes_sink.flush()
                 rt.latency_sink.flush()
+                rt.live_samples_sink.flush()
     finally:
         for t in tasks:
             t.cancel()

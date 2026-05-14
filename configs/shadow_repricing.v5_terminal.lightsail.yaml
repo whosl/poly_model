@@ -17,6 +17,7 @@ model:
   version: pm_terminal_v5_hold_to_expiry
   fee_rate: 0.07
   slippage_buffer: 0.0025
+  target_shares: 6.0
 
 market_meta:
   silver_pm_path: /opt/pm-shadow/repo/configs/shadow_market_meta.parquet
@@ -80,6 +81,10 @@ candidate_logging:
   enabled: true
   min_prob: 0.0
   min_abs_edge: -999.0
+
+live_data_collection:
+  enabled: true
+  sample_interval_seconds: 1.0
 
 dry_run:
   historical_gold_path: /opt/pm-shadow/repo/configs/shadow_dryrun_gold_sample.parquet
