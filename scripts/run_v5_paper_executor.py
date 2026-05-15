@@ -65,6 +65,7 @@ class ParquetBuffer:
 @dataclass
 class ExecutorConfig:
     signals_dir: Path
+    signal_queue_path: Path | None
     output_dir: Path
     state_path: Path
     market_meta_path: Path
@@ -93,6 +94,7 @@ def load_config(path: str | Path) -> ExecutorConfig:
     raw = read_yaml(path)
     return ExecutorConfig(
         signals_dir=Path(raw.get("signals_dir", "/opt/pm-shadow/data/shadow/repricing_signals")),
+        signal_queue_path=Path(raw["signal_queue_path"]) if raw.get("signal_queue_path") else None,
         output_dir=Path(raw.get("output_dir", "/opt/pm-shadow/data/shadow/v5_executor_decisions")),
         state_path=Path(raw.get("state_path", "/opt/pm-shadow/state/v5_paper_executor_state.json")),
         market_meta_path=Path(raw.get("market_meta_path", "/opt/pm-shadow/repo/configs/shadow_market_meta.parquet")),
@@ -157,15 +159,51 @@ def signal_files(root: Path, lookback_hours: float) -> list[Path]:
     return sorted([p for p in files if p.stat().st_mtime >= cutoff], key=lambda p: p.stat().st_mtime)
 
 
-def load_recent_signals(cfg: ExecutorConfig) -> pl.DataFrame:
-    files = signal_files(cfg.signals_dir, cfg.lookback_hours)
-    if not files:
+def load_queue_signals(cfg: ExecutorConfig) -> pl.DataFrame:
+    path = cfg.signal_queue_path
+    if path is None or not path.exists():
         return pl.DataFrame()
-    df = pl.concat([pl.read_parquet(str(p)) for p in files], how="diagonal_relaxed")
-    if "model_version" in df.columns:
-        df = df.filter(pl.col("model_version") == cfg.model_version)
+    cutoff = utc_now() - timedelta(hours=cfg.lookback_hours)
+    rows: list[dict[str, Any]] = []
+    try:
+        # Tail-ish bounded read: signal lines are small; keep last ~5000.
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-5000:]
+    except Exception:
+        return pl.DataFrame()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("model_version") != cfg.model_version:
+            continue
+        ts = to_dt(row.get("sample_ts"))
+        if ts is not None and ts < cutoff:
+            continue
+        rows.append(row)
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+def load_recent_signals(cfg: ExecutorConfig) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    qdf = load_queue_signals(cfg)
+    if qdf.height:
+        frames.append(qdf)
+    files = signal_files(cfg.signals_dir, cfg.lookback_hours)
+    if files:
+        pdf = pl.concat([pl.read_parquet(str(p)) for p in files], how="diagonal_relaxed")
+        if "model_version" in pdf.columns:
+            pdf = pdf.filter(pl.col("model_version") == cfg.model_version)
+        if pdf.height:
+            frames.append(pdf)
+    if not frames:
+        return pl.DataFrame()
+    df = pl.concat(frames, how="diagonal_relaxed")
     if "signal_id" in df.columns:
-        df = df.unique(subset=["signal_id"], keep="last")
+        # Prefer JSONL queue rows because they arrive first and include queue_write_ts.
+        df = df.unique(subset=["signal_id"], keep="first")
     return df.sort("sample_ts") if "sample_ts" in df.columns else df
 
 

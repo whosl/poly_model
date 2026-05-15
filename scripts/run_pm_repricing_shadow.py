@@ -195,6 +195,10 @@ def normalize_shadow_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
             "report_dir": output_section.get("report_dir", "reports/shadow"),
             "flush_interval_seconds": int(output_section.get("flush_interval_seconds", 10)),
         },
+        "signal_queue": {
+            "enabled": bool((cfg.get("signal_queue") or {}).get("enabled", False)),
+            "path": (cfg.get("signal_queue") or {}).get("path", "data/shadow/v5_signal_queue/signals.jsonl"),
+        },
         "binance": {
             "symbol": _get_nested(cfg, "binance", "symbol", default=feeds.get("binance", {}).get("symbol", "BTCUSDT")),
             "ws_url": _get_nested(cfg, "binance", "ws_url", default=None)
@@ -570,6 +574,11 @@ class ShadowRuntime:
         self.latency_sink = ParquetBuffer(base_shadow / "latency_metrics", "latency_metrics")
         self.live_samples_sink = ParquetBuffer(base_shadow / "live_model_samples", "live_model_samples")
         self.diagnostics_dir = ensure_dir(base_shadow / "run_diagnostics")
+        sq_cfg = cfg.get("signal_queue", {})
+        self.signal_queue_enabled = bool(sq_cfg.get("enabled", False))
+        self.signal_queue_path = Path(sq_cfg.get("path", base_shadow / "v5_signal_queue" / "signals.jsonl"))
+        if self.signal_queue_enabled:
+            ensure_dir(self.signal_queue_path.parent)
         self.last_live_sample_ts: dict[str, datetime] = {}
 
         self.stats: dict[str, Any] = {
@@ -1405,6 +1414,18 @@ class ShadowRuntime:
                 }
             )
 
+    def _append_signal_queue(self, signal_row: dict[str, Any]) -> None:
+        if not getattr(self, "signal_queue_enabled", False):
+            return
+        try:
+            payload = dict(signal_row)
+            payload["queue_write_ts"] = utc_now().isoformat()
+            with open(self.signal_queue_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, default=str, separators=(",", ":")) + "\n")
+                f.flush()
+        except Exception as exc:
+            LOGGER.warning("signal queue append failed: %s", exc)
+
     def _emit_signal(
         self,
         cfg: ShadowSignalConfig,
@@ -1478,6 +1499,7 @@ class ShadowRuntime:
             "is_forced_signal": is_forced_signal,
         }
         self.signals_sink.append(signal_row)
+        self._append_signal_queue(signal_row)
         self.latency_sink.append(
             {
                 "run_id": self.run_id,

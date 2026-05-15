@@ -10,14 +10,18 @@ outputs:
   report_dir: /opt/pm-shadow/reports/shadow
   flush_interval_seconds: 5
 
+signal_queue:
+  enabled: true
+  path: /opt/pm-shadow/data/shadow/v5_signal_queue/signals.jsonl
+
 model:
   type: terminal_binary
   model_path: /opt/pm-shadow/repo/models/pm_terminal/lightgbm.joblib
   features_path: /opt/pm-shadow/repo/models/pm_terminal/features_pm_terminal.json
-  version: pm_terminal_v5_hold_to_expiry
+  version: pm_terminal_v6_tail_chase_strict_shadow
   fee_rate: 0.07
-  slippage_buffer: 0.0025
-  target_shares: 6.0
+  slippage_buffer: 0.01
+  target_shares: 25.0
 
 market_meta:
   silver_pm_path: /opt/pm-shadow/repo/configs/shadow_market_meta.parquet
@@ -63,13 +67,23 @@ polymarket:
 
 signals:
   configs:
-    - name: v5_terminal_hold_edge10
+    - name: v6_terminal_tail_chase_strict
       direction: BOTH
-      # These are net terminal edge thresholds after entry fee + slippage buffer.
-      up_threshold: 0.10
-      down_threshold: 0.10
-      max_spread: 0.02
-      min_time_to_expiry_seconds: 30
+      # Net terminal edge thresholds after entry fee + slippage buffer.
+      # Tail-chase: only the last 5-45s of each 15m market, with strict live
+      # quote freshness, spread, pair overround and depth constraints.
+      up_threshold: 0.05
+      down_threshold: 0.05
+      min_cost_adjusted_edge: 0.02
+      max_spread: 0.08
+      max_pair_ask_sum: 1.08
+      min_time_to_expiry_seconds: 5
+      max_time_to_expiry_seconds: 45
+      max_quote_age_seconds: 2.0
+      max_seconds_since_pm_update: 2.0
+      order_size_shares: 25.0
+      min_ask_depth_5: 100.0
+      max_depth_fraction: 0.25
       cooldown_seconds: 900
 
 simulation:
