@@ -1,0 +1,25 @@
+mode: paper
+signals_dir: /opt/pm-shadow/data/shadow/repricing_signals
+signal_queue_path: /opt/pm-shadow/data/shadow/v6_tail_chase_signal_queue/signals.jsonl
+output_dir: /opt/pm-shadow/data/shadow/v6_tail_chase_executor_decisions
+state_path: /opt/pm-shadow/state/v6_tail_chase_paper_executor_state.json
+market_meta_path: /opt/pm-shadow/repo/configs/shadow_market_meta.parquet
+model_version: pm_terminal_v6_tail_chase_strict_shadow
+poll_seconds: 5
+lookback_hours: 8
+max_signal_age_seconds: 90
+ignore_existing_on_start: true
+
+target_shares: 25.0
+limit_price_offset: 0.01
+max_limit_price: 0.95
+min_limit_price: 0.01
+min_order_notional: 1.00
+min_tte_seconds: 5
+max_tte_seconds: 45
+max_effective_ask: 0.90
+max_spread: 0.08
+one_trade_per_market_side: true
+max_decisions_per_hour: 12
+allow_up: true
+allow_down: true
